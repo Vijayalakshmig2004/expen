@@ -14,14 +14,55 @@ import { db } from '../lib/firebase';
 import { Expense, Settlement, Balance, UserProfile } from '../types';
 import { convertCurrency } from './currencyService';
 
-export const addExpense = async (expense: Omit<Expense, 'id' | 'createdAt'>): Promise<string> => {
+/**
+ * Add an expense with support for equal and percentage splits.
+ */
+export const addExpense = async (
+  expense: Omit<Expense, 'id' | 'createdAt'> & {
+    splitMethod: 'equal' | 'percentage';
+    percentages?: Record<string, number>;
+  }
+): Promise<string> => {
   try {
+    const { amount, paidBy, splitBetween, currency, groupId, splitMethod, percentages } = expense;
+
+    const convertedAmount = amount; // Currency conversion if needed
+    let splitDetails: Record<string, number> = {};
+
+    if (splitMethod === 'equal') {
+      const perPerson = convertedAmount / splitBetween.length;
+      splitBetween.forEach(uid => {
+        splitDetails[uid] = parseFloat(perPerson.toFixed(2));
+      });
+    } else if (splitMethod === 'percentage') {
+      if (!percentages) throw new Error('Percentages must be provided for percentage split.');
+
+      let totalPercent = 0;
+      splitBetween.forEach(uid => {
+        const percent = percentages[uid] || 0;
+        totalPercent += percent;
+        splitDetails[uid] = parseFloat(((percent / 100) * convertedAmount).toFixed(2));
+      });
+
+      if (Math.abs(totalPercent - 100) > 0.1) {
+        throw new Error('Percentages must add up to 100.');
+      }
+    }
+
     const newExpense = {
-      ...expense,
+      paidBy,
+      amount,
+      currency,
+      groupId,
+      splitBetween,
+      splitMethod,
+      percentages: splitMethod === 'percentage' ? percentages : undefined,
+      splitDetails,
       createdAt: new Date().toISOString(),
+      date: new Date().toISOString()
     };
-    
-    const docRef = await addDoc(collection(db, `groups/${expense.groupId}/expenses`), newExpense);
+
+    const docRef = await addDoc(collection(db, `groups/${groupId}/expenses`), newExpense);
     return docRef.id;
   } catch (error) {
     console.error('Error adding expense:', error);
@@ -84,6 +125,9 @@ export const deleteExpense = async (groupId: string, expenseId: string): Promise
   }
 };
 
+/**
+ * Calculates member balances and settlements.
+ */
 export const calculateBalances = async (
   groupId: string, 
   expenses: Expense[], 
@@ -95,7 +139,7 @@ export const calculateBalances = async (
 }> => {
   const balances: Record<string, Balance> = {};
   
-  // Initialize balances for all members
+  // Initialize balances
   members.forEach(member => {
     balances[member.uid] = {
       userId: member.uid,
@@ -104,61 +148,53 @@ export const calculateBalances = async (
     };
   });
   
-  // Calculate raw balances
+  // Calculate balances
   expenses.forEach(expense => {
     const paidBy = expense.paidBy;
-    const amount = expense.amount;
     const fromCurrency = expense.currency;
-    
-    // Convert to group's base currency
-    const convertedAmount = convertCurrency(amount, fromCurrency, baseCurrency);
-    
-    // Update the payer's balance
+    const convertedAmount = convertCurrency(expense.amount, fromCurrency, baseCurrency);
+
+    // Credit the payer
     balances[paidBy].amount += convertedAmount;
-    
-    // Calculate how much each person owes
-    const splitAmount = convertedAmount / expense.splitBetween.length;
-    
-    expense.splitBetween.forEach(userId => {
-      // If the user is the payer, don't subtract their own share
+
+    // Debit each participant
+    Object.entries(expense.splitDetails || {}).forEach(([userId, amount]) => {
       if (userId !== paidBy) {
-        balances[userId].amount -= splitAmount;
+        const convertedShare = convertCurrency(amount, fromCurrency, baseCurrency);
+        balances[userId].amount -= convertedShare;
       }
     });
   });
   
-  // Generate simplified settlements
   const settlements = simplifyDebts(balances, baseCurrency);
   
   return { balances, settlements };
 };
 
-// Algorithm to minimize the number of transactions
+/**
+ * Simplify debts into a minimal set of transactions.
+ */
 export const simplifyDebts = (
   balances: Record<string, Balance>,
   baseCurrency: string
 ): Settlement[] => {
   const settlements: Settlement[] = [];
   
-  // Separate users who owe money and users who are owed money
   const debtors: { userId: string; amount: number }[] = [];
   const creditors: { userId: string; amount: number }[] = [];
   
   for (const userId in balances) {
     const balance = balances[userId].amount;
-    
-    if (balance < 0) {
+    if (balance < -0.01) {
       debtors.push({ userId, amount: Math.abs(balance) });
-    } else if (balance > 0) {
+    } else if (balance > 0.01) {
       creditors.push({ userId, amount: balance });
     }
   }
   
-  // Sort by amount (highest first)
   debtors.sort((a, b) => b.amount - a.amount);
   creditors.sort((a, b) => b.amount - a.amount);
   
-  // Greedy algorithm to minimize transactions
   let i = 0;
   let j = 0;
   
@@ -168,11 +204,11 @@ export const simplifyDebts = (
     
     const amount = Math.min(debtor.amount, creditor.amount);
     
-    if (amount > 0.01) { // Ignore very small amounts
+    if (amount > 0.01) {
       settlements.push({
         from: debtor.userId,
         to: creditor.userId,
-        amount,
+        amount: parseFloat(amount.toFixed(2)),
         currency: baseCurrency,
         settled: false
       });
